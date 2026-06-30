@@ -619,6 +619,8 @@ Rails.application.routes.draw do
   get 'webhooks/twitter', to: 'api/v1/webhooks#twitter_crc'
   post 'webhooks/twitter', to: 'api/v1/webhooks#twitter_events'
   post 'webhooks/line/:line_channel_id', to: 'webhooks/line#process_payload'
+  get  'webhooks/wecom/:identifier', to: 'webhooks/wecom#verify_url'
+  post 'webhooks/wecom/:identifier', to: 'webhooks/wecom#process_payload'
   post 'webhooks/telegram/:bot_token', to: 'webhooks/telegram#process_payload'
   post 'webhooks/sms/:phone_number', to: 'webhooks/sms#process_payload'
   get 'webhooks/whatsapp/:phone_number', to: 'webhooks/whatsapp#verify'
