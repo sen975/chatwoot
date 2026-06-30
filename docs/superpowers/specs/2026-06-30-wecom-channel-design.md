@@ -14,7 +14,7 @@
     ▼
 企业微信客服系统 (open_kfid)
     │
-    │ 回调 URL (GET/POST)
+    │ 回调 URL (GET: URL验证 / POST: 事件通知)
     ▼
 Webhooks::WecomController
     │  GET  → verify_url (解密 echostr 返回)
@@ -24,8 +24,11 @@ Webhooks::WecomEventsJob
     │  1. Channel::Wecom.find_by!(identifier:)
     │  2. Wecom::Crypto.verify_signature
     │  3. Wecom::Crypto.decrypt
-    │  4. Redis 幂等锁 (wecom:dedup:{inbox_id}:{msgid})
-    │  5. → IncomingMessageService
+    │  4. 判断事件类型
+    │     - kf_msg_or_event → Wecom::Client.sync_msg (拉取消息列表)
+    │     - 其他事件 → activity message 或忽略
+    │  5. 遍历 msg_list, 每条消息 Redis 幂等锁
+    │  6. → IncomingMessageService
     ▼
 Wecom::IncomingMessageService
     │  1. ContactInboxWithContactBuilder (source_id = external_userid)
@@ -35,10 +38,19 @@ Wecom::IncomingMessageService
 坐席回复:
 Message after_create → SendReplyJob → Wecom::SendOnWecomService
     │  1. channel.agent_mappings[chatwoot_user_id] → servicer_userid
-    │  2. Wecom::Client.send_sync_msg(to_user:, open_kfid:, msgid:, servicer_userid:, msgtype:, text:)
+    │  2. Wecom::Client.send_msg(to_user:, open_kfid:, msgid:, servicer_userid: ?, msgtype:, text:)
     │  3. Messages::StatusUpdateService.new(message, 'delivered').perform
     │                     或 .new(message, 'failed', external_error).perform
 ```
+
+### 关键区分：sync_msg 与 send_msg
+
+| 方向 | 方法 | API | 说明 |
+|---|---|---|---|
+| 入站 (pull) | `Wecom::Client#sync_msg` | POST `/cgi-bin/kf/sync_msg` | 收到回调通知后拉取消息列表 |
+| 出站 (push) | `Wecom::Client#send_msg` | POST `/cgi-bin/kf/send_msg` | 坐席回复时推送消息到用户 |
+
+企业微信客服不会直接在回调 body 中给出完整消息内容（与自建应用不同）。回调通知"有客服消息/事件"，服务端再用 `sync_msg` 拉取实际消息列表。
 
 ## 文件清单
 
@@ -47,9 +59,9 @@ Message after_create → SendReplyJob → Wecom::SendOnWecomService
 | DB | `db/migrate/xxx_create_channel_wecom.rb` | 建表 |
 | Model | `app/models/channel/wecom.rb` | 渠道配置、encrypts、validations |
 | Lib | `lib/wecom/crypto.rb` | 消息加解密 (AES-256-CBC + SHA1) + echostr |
-| Lib | `lib/wecom/client.rb` | KF API 客户端 (token管理、发消息、查客户) |
-| Webhook | `app/controllers/webhooks/wecom_controller.rb` | 回调入口（URL 验证 + 消息接收） |
-| Job | `app/jobs/webhooks/wecom_events_job.rb` | 验签、解密、幂等、分发 |
+| Lib | `lib/wecom/client.rb` | KF API 客户端 (token管理、sync_msg、send_msg、查客户) |
+| Webhook | `app/controllers/webhooks/wecom_controller.rb` | 回调入口（URL 验证 + 消息通知） |
+| Job | `app/jobs/webhooks/wecom_events_job.rb` | 验签、解密、调用 sync_msg、幂等、分发 |
 | Service | `app/services/wecom/incoming_message_service.rb` | 收消息处理 |
 | Service | `app/services/wecom/send_on_wecom_service.rb` | 发消息处理（继承 Base::SendOnChannelService） |
 | Frontend | `app/javascript/.../channels/Wecom.vue` | 渠道配置表单（含坐席映射） |
@@ -97,43 +109,48 @@ post 'webhooks/wecom/:identifier', to: 'webhooks/wecom#process_payload'
 
 企业微信配置回调 URL 时发送 GET 请求，携带 `msg_signature`、`timestamp`、`nonce`、`echostr` 参数。Controller 直接解密 echostr 返回明文。
 
-### 消息回调 (POST)
+### 事件通知回调 (POST)
 
-企业微信 POST XML body，query string 携带 `msg_signature`、`timestamp`、`nonce`。
+企业微信 POST XML body（加密的事件通知，非完整消息），query string 携带 `msg_signature`、`timestamp`、`nonce`。
 
 处理链路：
 1. `Webhooks::WecomController#process_payload` → 入队 job → 返回 `head :ok`
 2. `Webhooks::WecomEventsJob` → 查渠道 → 验签 → 解密 XML
-3. Redis 幂等锁 → 分发到 IncomingMessageService
+3. 判断事件类型：
+   - `kf_msg_or_event` → `Wecom::Client#sync_msg` 拉取 `msg_list`
+   - 遍历 `msg_list`，每条消息 Redis 幂等锁 → `IncomingMessageService`
+   - 其他事件 → 记录 info 日志，不创建消息
 4. 验签或解密失败 → 记录错误日志 → discard job
 
 ### 支持的消息类型
 
-第一阶段：仅 `text`。其他类型（image/voice/video/file/event）记录为 activity message，内容体后续再实现。
+第一阶段：仅 `text`（从 `msg_list` 中筛选 `msgtype: 'text'`）。其他类型记录 info 日志，不创建消息。
 
 ## Webhook 幂等与高并发
 
 ### 消息去重
 
-Redis 分布式锁防止企业微信回调重试导致重复消息：
+Redis 分布式锁防止回调重试导致重复消息：
 
 ```
 key: "wecom:dedup:{inbox_id}:{msgid}"
 value: "1"
 TTL: 300 (覆盖企业微信重试窗口)
-SET NX → 拿到锁继续，否则 discard job
+SET NX → 拿到锁继续，否则 discard job (debug log)
 ```
 
-兜底：inbox_id + msgid 查最近消息，重复时降级为 activity message。
+DB 兜底：inbox_id + msgid 查已有 message，存在则 discard，不创建 activity。
 
 不使用 DB 唯一约束（不同 inbox/channel 的 source_id 可能重复，outgoing message 的回写也会更新 source_id）。
 
 ### Token 并发保护
 
 ```
-Redis 锁 key: "wecom:token:{corp_id}"
+Redis 锁 key: "wecom:token:{channel_id}"
 刷新 token 时获取锁，失败则等待 200ms 后重试读取缓存，最多 3 次
 ```
+
+基于 `channel_id` 而非 `corp_id`，避免同一企业多个客服账号串 token。
 
 ### 企业微信 API 限流
 
@@ -156,12 +173,17 @@ KF API 限流：每应用 20 次/秒。收到 errcode 45009 后指数退避重�
 class Wecom::Client
   def initialize(corp_id:, secret:)
 
-  # Token 管理（Redis 缓存 + 分布式锁防并发刷新）
+  # Token 管理（Redis 缓存 + 分布式锁防并发刷新，key 基于 channel_id）
   def access_token
 
+  # 拉取客服消息 POST /cgi-bin/kf/sync_msg
+  # 返回 msg_list: [{ msgid:, open_kfid:, external_userid:, send_time:, msgtype:, text: }]
+  def sync_msg(cursor: nil, token:, open_kfid:, limit: 100)
+
   # 发送客服消息 POST /cgi-bin/kf/send_msg
-  # msgid 用于关联 Chatwoot outgoing message 的 source_id
-  def send_sync_msg(to_user:, open_kfid:, msgid:, servicer_userid: nil, msgtype: 'text', text:)
+  # msgid: 使用 "cw-#{message.id}" 作为唯一标识
+  # servicer_userid: 可选，传入则指定坐席，不传则由企业微信按客服账号发送
+  def send_msg(to_user:, open_kfid:, msgid:, msgtype: 'text', text:, servicer_userid: nil)
 
   # 获取客户信息 POST /cgi-bin/kf/customer/batchget
   def get_customer(external_userid:)
@@ -178,30 +200,37 @@ class Wecom::SendOnWecomService < Base::SendOnChannelService
   def channel_class = Channel::Wecom
 
   def perform_reply
-    # 1. 查 agent_mappings[message.sender_id] → servicer_userid
-    # 2. client.send_sync_msg(
+    # 1. 查 agent_mappings[message.sender_id] → servicer_userid（有则传，无则 nil）
+    # 2. msgid = "cw-#{message.id}"（不预先写 message.source_id）
+    # 3. client.send_msg(
     #      to_user:  message.conversation.contact_inbox.source_id,
     #      open_kfid: channel.open_kfid,
-    #      msgid:    message.source_id || message.id.to_s,
-    #      servicer_userid: servicer_userid,
+    #      msgid:    "cw-#{message.id}",
+    #      servicer_userid: servicer_userid,  # 可为 nil，企业微信按客服账号兜底
     #      msgtype:  'text',
     #      text:     { content: message.content }
     #    )
-    # 3. 成功 → Messages::StatusUpdateService.new(message, 'delivered').perform
+    # 4. 成功 → Messages::StatusUpdateService.new(message, 'delivered').perform
     #    失败 → Messages::StatusUpdateService.new(message, 'failed', external_error).perform
+    # 5. 如果企业微信返回了外部消息 ID，回写 message.source_id
   end
 end
 ```
 
 `SendReplyJob::CHANNEL_SERVICES` 注册：`'Channel::Wecom' => ::Wecom::SendOnWecomService`
 
+**msgid 处理原则**：
+- 发送前使用 `"cw-#{message.id}"` 作为 msgid，不提前设置 `message.source_id`
+- `Base::SendOnChannelService` 会跳过 `source_id.present?` 的 outgoing message，不要为了传 msgid 提前写 source_id
+- 如果企业微信返回了外部消息 ID 则回写，否则不处理
+
 ## 坐席映射
 
 回复时查找当前 Chatwoot 用户对应的企业微信 `servicer_userid`：
 
-1. `channel.agent_mappings[current_user_id]` → 有值则用
-2. 无映射 → 取 `agent_mappings` 第一个值作为默认
-3. `agent_mappings` 为空 → 消息发送失败，返回错误提示
+1. `channel.agent_mappings[current_user_id]` → 有值则传入 `servicer_userid`
+2. 无映射 → 不传 `servicer_userid`（`nil`），企业微信按客服账号默认发送
+3. 不强取第一个值（会错误冒充其他坐席）
 
 坐席映射在前端 Wecom.vue 表单中配置：下拉选择 Chatwoot 用户 → 填入对应的企业微信 userid。
 
@@ -209,18 +238,21 @@ end
 
 | 场景 | 处理 |
 |---|---|
-| 回调签名/解密失败 | 丢弃 job，记录错误日志 |
-| Redis 锁未获取（重复消息） | 丢弃 job |
+| 回调签名/解密失败 | 丢弃 job，记录 error 日志 |
+| 非 `kf_msg_or_event` 事件 | 记录 info 日志，不创建消息 |
+| 非 text 消息类型 | 记录 info 日志，不创建消息（第一阶段） |
+| Redis 锁未获取（重复消息） | 丢弃 job，记录 debug 日志 |
+| sync_msg 返回空 msg_list | 正常结束 |
 | token 过期 (errcode 42001) | Client 自动刷新后重试 1 次 |
 | API 限流 (errcode 45009) | 指数退避 (1s/2s/4s)，最多 3 次 |
 | 发送失败 (其他 errcode) | `Messages::StatusUpdateService` 标记 failed |
-| 坐席无映射 | 消息标记 failed，返回错误 |
+| 坐席无映射 | 不传 servicer_userid，企业微信按客服账号兜底 |
 
 ## 前端
 
 复用四步向导：ChannelList → ChannelFactory → AddAgents → FinishSetup。
 
-新增 `channels/Wecom.vue`：corp_id、open_kfid、secret、token、encoding_aes_key + 坐席映射（下拉选择 Chatwoot 用户 → 企业微信 userid）。
+新增 `channels/Wecom.vue`：corp_id、open_kfid、secret、token、encoding_aes_key + 坐席映射（下拉选择 Chatwoot 用户 → 企业微信 userid）。后端先跑通，前端坐席映射可后置。
 
 FinishSetup 显示回调 URL (`/webhooks/wecom/{identifier}`) 和标识符。
 
@@ -247,8 +279,8 @@ FinishSetup 显示回调 URL (`/webhooks/wecom/{identifier}`) 和标识符。
 
 - **Model**: 字段验证、identifier 自动生成、encrypts 加密、唯一索引
 - **Crypto**: 签名验证 + 解密 + echostr（使用企业微信官方示例向量）
-- **Client**: token 获取/缓存/过期/并发刷新、send_sync_msg、限流重试
-- **Job**: 验签成功→分发、验签失败→丢弃、幂等锁→重复消息丢弃
-- **Service (incoming)**: 收消息→联系人创建→conversation→message
-- **Service (send)**: 坐席映射选择、发消息→client 调用、状态更新
+- **Client**: token 获取/缓存/过期/并发刷新、sync_msg、send_msg、限流重试
+- **Job**: 验签成功→sync_msg→分发、验签失败→丢弃、幂等锁→重复消息丢弃
+- **Service (incoming)**: sync_msg 结果→联系人创建→conversation→message
+- **Service (send)**: 坐席映射选择、send_msg→调用 client、状态更新、source_id 回写
 - **Controller**: URL 验证、消息回调返回 200
