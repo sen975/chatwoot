@@ -1,33 +1,41 @@
-# WeCom KF Channel Implementation Plan
+# 企业微信客服渠道实现计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **面向 agentic worker：** 必须使用子技能：superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 按任务逐项实现。步骤使用 checkbox（`- [ ]`）语法跟踪。
 
-**Goal:** Add WeChat Work KF Agent (企业微信客服) as a standard OSS channel in Chatwoot, supporting text message send/receive.
+**目标：** 在 Chatwoot OSS 版本中新增企业微信客服 (WeChat Work KF Agent) 作为标准渠道，支持文本消息收发。
 
-**Architecture:** Follows the LINE/Telegram channel pattern: Channel::Wecom model → webhook controller → background job (with crypto verification + sync_msg pull) → incoming message service → contact/conversation/message creation. Outbound: SendReplyJob → SendOnWecomService → Wecom::Client.send_msg → Messages::StatusUpdateService.
+**架构：** 沿用 LINE/Telegram 渠道模式：Channel::Wecom model → webhook controller → 后台 job（含加解密验签 + sync_msg 拉取）→ 入站消息服务 → 联系人/会话/消息创建。出站：SendReplyJob → SendOnWecomService → Wecom::Client.send_msg → Messages::StatusUpdateService。
 
-**Tech Stack:** Ruby on Rails, Sidekiq/ActiveJob, Redis (dedup locks + token cache), Vue 3 Composition API, Tailwind CSS.
+**技术栈：** Ruby on Rails、Sidekiq/ActiveJob、Redis（去重锁 + token 缓存）、Vue 3 Options API（对齐 Line.vue 模式）、Tailwind CSS。
 
-**Spec:** [2026-06-30-wecom-channel-design.md](../specs/2026-06-30-wecom-channel-design.md)
+**设计文档：** [2026-06-30-wecom-channel-design.md](../specs/2026-06-30-wecom-channel-design.md)
+
+**提交策略：** 3 次阶段性提交（非每任务提交）。推荐构建顺序：后端基础设施 → 消息收发服务 → 冒烟测试 → 前端最后。
+
+---
+## 阶段一：后端渠道基础设施
+*提交信息：`feat(wecom): add backend channel plumbing`*
+
+任务：Task 1-9 — 数据库迁移、Channel::Wecom 模型、加解密库、API 客户端、Account 关联、Inbox 模型、InboxesController 注册、InboxesHelper 注册、路由。
 
 ---
 
-### Task 1: Database Migration
+### Task 1: 数据库迁移
 
-**Files:**
-- Create: `db/migrate/20260630000001_create_channel_wecom.rb`
+**涉及文件：**
+- 新建：`db/migrate/20260630000001_create_channel_wecom.rb`
 
-- [ ] **Step 1: Generate skeleton via Rails generator**
+- [ ] **步骤 1：通过 Rails 生成器创建骨架**
 
 ```bash
 bundle exec rails generate migration CreateChannelWecom
 ```
 
-Expected: Creates a migration file in `db/migrate/`.
+预期：在 `db/migrate/` 下生成迁移文件。
 
-- [ ] **Step 2: Write the migration**
+- [ ] **步骤 2：编写迁移内容**
 
-Replace the generated migration file content with:
+用以下内容替换生成的迁移文件：
 
 ```ruby
 class CreateChannelWecom < ActiveRecord::Migration[7.0]
@@ -41,6 +49,7 @@ class CreateChannelWecom < ActiveRecord::Migration[7.0]
       t.text :token, null: false
       t.text :encoding_aes_key, null: false
       t.jsonb :agent_mappings, default: {}
+      t.text :sync_cursor
       t.datetime :created_at, null: false
       t.datetime :updated_at, null: false
     end
@@ -52,37 +61,38 @@ class CreateChannelWecom < ActiveRecord::Migration[7.0]
 end
 ```
 
-- [ ] **Step 3: Run migration**
+- [ ] **步骤 3：执行迁移**
 
 ```bash
 bundle exec rails db:migrate
 ```
 
-Expected: `== 20260630000001 CreateChannelWecom: migrated`
+预期：`== 20260630000001 CreateChannelWecom: migrated`
 
-- [ ] **Step 4: Verify schema**
-
-```bash
-grep -A 12 "channel_wecom" db/schema.rb
-```
-
-Expected: Shows the table definition in schema.rb.
-
-- [ ] **Step 5: Commit**
+- [ ] **步骤 4：验证 schema**
 
 ```bash
-git add db/migrate/20260630000001_create_channel_wecom.rb db/schema.rb
-git commit -m "feat: add channel_wecom table migration"
+Select-String -Path db/schema.rb -Pattern "channel_wecom" -Context 0,12
 ```
+
+预期：在 schema.rb 中显示表定义。
+
+- [ ] **步骤 5：验证迁移可回滚**
+
+```bash
+bundle exec rails db:migrate:down VERSION=20260630000001 && bundle exec rails db:migrate:up VERSION=20260630000001
+```
+
+预期：回滚和重新迁移均成功。
 
 ---
 
-### Task 2: Channel Model
+### Task 2: 渠道模型
 
-**Files:**
-- Create: `app/models/channel/wecom.rb`
+**涉及文件：**
+- 新建：`app/models/channel/wecom.rb`
 
-- [ ] **Step 1: Create the model file**
+- [ ] **步骤 1：创建模型文件**
 
 ```ruby
 class Channel::Wecom < ApplicationRecord
@@ -95,14 +105,15 @@ class Channel::Wecom < ApplicationRecord
   end
 
   self.table_name = 'channel_wecom'
-  EDITABLE_ATTRS = [:corp_id, :open_kfid, :secret, :token, :encoding_aes_key, :agent_mappings].freeze
+  EDITABLE_ATTRS = [:corp_id, :open_kfid, :secret, :token, :encoding_aes_key, { agent_mappings: {} }].freeze
 
   validates :corp_id, presence: true
   validates :open_kfid, presence: true
   validates :secret, presence: true
   validates :token, presence: true
   validates :encoding_aes_key, presence: true, length: { is: 43 }
-  validates :identifier, uniqueness: true
+  validates :identifier, presence: true, uniqueness: true
+  validates :open_kfid, uniqueness: { scope: :corp_id }
 
   has_secure_token :identifier
 
@@ -116,50 +127,44 @@ class Channel::Wecom < ApplicationRecord
 end
 ```
 
-- [ ] **Step 2: Verify model loads**
+- [ ] **步骤 2：验证模型可加载**
 
 ```bash
 bundle exec rails runner "puts Channel::Wecom.new.class.name"
 ```
 
-Expected: `Channel::Wecom`
+预期：`Channel::Wecom`
 
-- [ ] **Step 3: Commit**
+- [ ] **步骤 3：验证 identifier 自动生成**
 
 ```bash
-git add app/models/channel/wecom.rb
-git commit -m "feat: add Channel::Wecom model"
+bundle exec rails runner "puts Channel::Wecom.new(account: Account.first, corp_id: 'x', open_kfid: 'y', secret: 's', token: 't', encoding_aes_key: 'a'*43).identifier"
 ```
+
+预期：输出 24 位十六进制 token（has_secure_token 自动生成）。
 
 ---
 
-### Task 3: Crypto Library
+### Task 3: 加解密库
 
-**Files:**
-- Create: `lib/wecom/crypto.rb`
+**涉及文件：**
+- 新建：`lib/wecom/crypto.rb`
 
-- [ ] **Step 1: Create the crypto module**
+- [ ] **步骤 1：创建 Crypto 模块**
 
 ```ruby
 module Wecom
   module Crypto
     BLOCK_SIZE = 32
 
-    def self.decrypt_echostr(corp_id, params)
-      encrypted = params[:echostr]
-      token = find_token(corp_id)
-      encoding_aes_key = find_encoding_aes_key(corp_id)
-
-      verify_signature!(token, params[:timestamp], params[:nonce], encrypted, params[:msg_signature])
-      decrypt(encoding_aes_key, encrypted)
-    end
-
     def self.verify_signature(token, timestamp, nonce, encrypt, msg_signature)
+      return false if msg_signature.blank?
+
       expected = signature(token, timestamp, nonce, encrypt)
       ActiveSupport::SecurityUtils.secure_compare(expected, msg_signature)
     end
 
-    def self.decrypt(encoding_aes_key, encrypted_text)
+    def self.decrypt(encoding_aes_key, encrypted_text, expected_receive_id: nil)
       aes_key = Base64.decode64(encoding_aes_key + '=')
       ciphertext = Base64.decode64(encrypted_text)
       iv = aes_key[0..15]
@@ -173,8 +178,15 @@ module Wecom
       plaintext = decipher.update(ciphertext) + decipher.final
       plaintext = remove_padding(plaintext)
 
+      # 明文结构：random(16) + msg_len(4) + content(msg_len) + receiveid
       content_length = plaintext[16..19].unpack1('N')
       content = plaintext[20..(20 + content_length - 1)]
+      receiveid = plaintext[(20 + content_length)..]
+
+      if expected_receive_id.present? && receiveid != expected_receive_id
+        raise "receiveid mismatch: expected #{expected_receive_id}, got #{receiveid}"
+      end
+
       content
     end
 
@@ -195,29 +207,32 @@ module Wecom
 end
 ```
 
-- [ ] **Step 2: Verify Crypto loads**
+- [ ] **步骤 2：验证 Crypto 可加载**
 
 ```bash
 bundle exec rails runner "puts Wecom::Crypto.verify_signature('t', '1', 'n', 'e', Wecom::Crypto.signature('t','1','n','e'))"
 ```
 
-Expected: `true`
+预期：`true`
 
-- [ ] **Step 3: Commit**
+- [ ] **步骤 3：运行单元测试**
 
 ```bash
-git add lib/wecom/crypto.rb
-git commit -m "feat: add Wecom::Crypto for message encryption/signature"
+bundle exec rails runner "
+puts Wecom::Crypto.verify_signature('t', '1', 'n', 'e', Wecom::Crypto.signature('t','1','n','e'))
+"
 ```
+
+预期：`true`
 
 ---
 
-### Task 4: Client Library (API Client)
+### Task 4: API 客户端
 
-**Files:**
-- Create: `lib/wecom/client.rb`
+**涉及文件：**
+- 新建：`lib/wecom/client.rb`
 
-- [ ] **Step 1: Create the client module**
+- [ ] **步骤 1：创建 Client 模块**
 
 ```ruby
 require 'net/http'
@@ -229,7 +244,7 @@ module Wecom
     BASE_URL = 'https://qyapi.weixin.qq.com'.freeze
     TOKEN_CACHE_KEY_PREFIX = 'wecom:token'.freeze
     TOKEN_LOCK_KEY_PREFIX = 'wecom:token:lock'.freeze
-    TOKEN_TTL = 7000 # seconds (token expires in 7200)
+    TOKEN_TTL = 7000 # token 有效期 7200 秒，取 7000 留余量
 
     class WecomApiError < StandardError
       attr_reader :errcode, :errmsg
@@ -260,7 +275,7 @@ module Wecom
         sleep(0.2) if attempt < 2
       end
 
-      Redis::Alfred.get(cache_key)
+      raise WecomApiError.new(errcode: -1, errmsg: 'Failed to obtain access token after 3 attempts')
     end
 
     def sync_msg(cursor: nil, token: nil, open_kfid:, limit: 100)
@@ -300,12 +315,27 @@ module Wecom
 
     private
 
+    # 直接 HTTP 调用获取 access_token — 必须绕过 request() 方法，
+    # 因为 request() 本身会调用 access_token()，形成递归。
+    def fetch_access_token
+      uri = URI("#{BASE_URL}/cgi-bin/gettoken?corpid=#{@corp_id}&corpsecret=#{@secret}")
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = true
+      http.open_timeout = 5
+      http.read_timeout = 10
+
+      res = http.get(uri.request_uri)
+      JSON.parse(res.body)
+    end
+
     def refresh_token(lock_key)
       return nil unless Redis::Alfred.set(lock_key, '1', nx: true, ex: 5)
 
       begin
-        response = get("/cgi-bin/gettoken?corpid=#{@corp_id}&corpsecret=#{@secret}")
+        response = fetch_access_token
         token = response['access_token']
+        raise WecomApiError.new(errcode: response['errcode'], errmsg: response['errmsg']) if token.blank?
+
         Redis::Alfred.set("#{TOKEN_CACHE_KEY_PREFIX}:#{@channel_id}", token, ex: TOKEN_TTL)
         token
       ensure
@@ -316,7 +346,7 @@ module Wecom
     def request(method, path, body: nil, retries: 3)
       uri = URI("#{BASE_URL}#{path}")
       token = access_token
-      uri.query = [uri.query, "access_token=#{token}"].compact.join('&') if token && method == :get
+      uri.query = [uri.query, "access_token=#{token}"].compact.join('&')
 
       http = Net::HTTP.new(uri.host, uri.port)
       http.use_ssl = true
@@ -363,61 +393,51 @@ module Wecom
 end
 ```
 
-- [ ] **Step 2: Verify Client loads**
+- [ ] **步骤 2：验证 Client 可加载**
 
 ```bash
 bundle exec rails runner "puts Wecom::Client.new(corp_id: 'x', secret: 'x', channel_id: 1).class.name"
 ```
 
-Expected: `Wecom::Client`
+预期：`Wecom::Client`
 
-- [ ] **Step 3: Commit**
+- [ ] **步骤 3：验证 Client 结构**
 
-```bash
-git add lib/wecom/client.rb
-git commit -m "feat: add Wecom::Client for KF API calls"
-```
+执行加载检查 — 然后通过代码审查确认 `fetch_access_token` 不会递归：调用链为 `request` → `access_token` → `refresh_token` → `fetch_access_token`（直接 HTTP，不经过 `request`），无循环。
 
 ---
 
-### Task 5: Account Association
+### Task 5: Account 关联
 
-**Files:**
-- Modify: `app/models/account.rb`
+**涉及文件：**
+- 修改：`app/models/account.rb`
 
-- [ ] **Step 1: Add has_many :wecom_channels to Account**
+- [ ] **步骤 1：添加 has_many :wecom_channels**
 
-In `app/models/account.rb`, find the `line_channels` association (around `has_many :line_channels, dependent: :destroy_async, class_name: '::Channel::Line'`). Add after it:
+在 `app/models/account.rb` 中找到 `line_channels` 关联（约在 `has_many :line_channels, dependent: :destroy_async, class_name: '::Channel::Line'` 处）。在其后添加：
 
 ```ruby
   has_many :wecom_channels, dependent: :destroy_async, class_name: '::Channel::Wecom'
 ```
 
-- [ ] **Step 2: Verify association**
+- [ ] **步骤 2：验证关联**
 
 ```bash
 bundle exec rails runner "Account.reflect_on_association(:wecom_channels).klass"
 ```
 
-Expected: `Channel::Wecom`
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add app/models/account.rb
-git commit -m "feat: add wecom_channels association to Account"
-```
+预期：`Channel::Wecom`
 
 ---
 
-### Task 6: Inbox Model Updates
+### Task 6: Inbox 模型更新
 
-**Files:**
-- Modify: `app/models/inbox.rb`
+**涉及文件：**
+- 修改：`app/models/inbox.rb`
 
-- [ ] **Step 1: Add wecom? helper method**
+- [ ] **步骤 1：添加 wecom? 辅助方法**
 
-In `app/models/inbox.rb`, find the `whatsapp?` method (e.g. `def whatsapp?`). Add after it:
+在 `app/models/inbox.rb` 中找到 `whatsapp?` 方法（如 `def whatsapp?`）。在其后添加：
 
 ```ruby
   def wecom?
@@ -425,40 +445,33 @@ In `app/models/inbox.rb`, find the `whatsapp?` method (e.g. `def whatsapp?`). Ad
   end
 ```
 
-- [ ] **Step 2: Add wecom to callback_webhook_url**
+- [ ] **步骤 2：在 callback_webhook_url 中添加 wecom 分支**
 
-In `app/models/inbox.rb`, find the `callback_webhook_url` method. Add a `when` clause after the LINE case:
+在 `app/models/inbox.rb` 中找到 `callback_webhook_url` 方法。在 LINE 的 `when` 分支后添加：
 
 ```ruby
     when 'Channel::Wecom'
       "#{ENV.fetch('FRONTEND_URL', nil)}/webhooks/wecom/#{channel.identifier}"
 ```
 
-- [ ] **Step 3: Verify**
+- [ ] **步骤 3：验证**
 
 ```bash
 bundle exec rails runner "puts Inbox.new(channel_type: 'Channel::Wecom').wecom?"
 ```
 
-Expected: `true`
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add app/models/inbox.rb
-git commit -m "feat: add wecom? helper and callback_webhook_url to Inbox"
-```
+预期：`true`
 
 ---
 
-### Task 7: Inboxes Controller Registration
+### Task 7: InboxesController 注册
 
-**Files:**
-- Modify: `app/controllers/api/v1/accounts/inboxes_controller.rb`
+**涉及文件：**
+- 修改：`app/controllers/api/v1/accounts/inboxes_controller.rb`
 
-- [ ] **Step 1: Register wecom in allowed_channel_types**
+- [ ] **步骤 1：在 allowed_channel_types 中注册 wecom**
 
-Find `allowed_channel_types` and add `wecom`:
+找到 `allowed_channel_types`，添加 `wecom`：
 
 ```ruby
   def allowed_channel_types
@@ -466,51 +479,83 @@ Find `allowed_channel_types` and add `wecom`:
   end
 ```
 
-- [ ] **Step 2: Register wecom in channel_type_from_params**
+- [ ] **步骤 2：在 channel_type_from_params 中注册 wecom**
 
-Find `channel_type_from_params` and add the `wecom` entry:
+找到 `channel_type_from_params`，添加 `wecom` 条目：
 
 ```ruby
       'wecom' => Channel::Wecom
 ```
 
-- [ ] **Step 3: Commit**
-
-```bash
-git add app/controllers/api/v1/accounts/inboxes_controller.rb
-git commit -m "feat: register wecom channel type in inboxes controller"
-```
-
 ---
 
-### Task 8: Inboxes Helper Registration
+### Task 8: InboxesHelper 注册
 
-**Files:**
-- Modify: `app/helpers/api/v1/inboxes_helper.rb`
+**涉及文件：**
+- 修改：`app/helpers/api/v1/inboxes_helper.rb`
 
-- [ ] **Step 1: Register wecom in account_channels_method**
+- [ ] **步骤 1：在 account_channels_method 中注册 wecom**
 
-Find `account_channels_method` and add the `wecom` entry:
+找到 `account_channels_method`，添加 `wecom` 条目：
 
 ```ruby
       'wecom' => Current.account.wecom_channels
 ```
 
-- [ ] **Step 2: Commit**
+---
+
+### Task 9: 路由
+
+**涉及文件：**
+- 修改：`config/routes.rb`
+
+- [ ] **步骤 1：添加 WeCom webhook 路由**
+
+在路由文件中找到 webhook 路由区域（LINE/Telegram webhook 路由附近）。添加：
+
+```ruby
+  get  'webhooks/wecom/:identifier', to: 'webhooks/wecom#verify_url'
+  post 'webhooks/wecom/:identifier', to: 'webhooks/wecom#process_payload'
+```
+
+- [ ] **步骤 2：验证路由**
 
 ```bash
-git add app/helpers/api/v1/inboxes_helper.rb
-git commit -m "feat: register wecom in account_channels_method helper"
+bundle exec rails routes | Select-String wecom
 ```
+
+预期：显示 GET 和 POST 两条 webhooks/wecom 路由。
 
 ---
 
-### Task 9: Webhook Controller
+- [ ] **阶段一提交前检查：enterprise/ overlay 审计**
 
-**Files:**
-- Create: `app/controllers/webhooks/wecom_controller.rb`
+```bash
+# AGENTS.md 要求检查新增核心文件是否有 enterprise/ 覆盖层。
+# 确认三个核心文件没有被 enterprise overlay 遮蔽：
+ls enterprise/app/models/channel/wecom.rb 2>/dev/null && echo "警告：存在 enterprise overlay" || echo "通过：无 enterprise overlay"
+ls enterprise/app/controllers/webhooks/wecom_controller.rb 2>/dev/null && echo "警告：存在 enterprise overlay" || echo "通过：无 enterprise overlay"
+ls enterprise/app/jobs/webhooks/wecom_events_job.rb 2>/dev/null && echo "警告：存在 enterprise overlay" || echo "通过：无 enterprise overlay"
+```
 
-- [ ] **Step 1: Create the controller**
+预期：三处均报告"通过：无 enterprise overlay"。
+
+---
+
+---
+## 阶段二：Webhook 收发服务
+*提交信息：`feat(wecom): add webhook sync and send services`*
+
+任务：Task 10-15 — WebhookController、EventsJob、IncomingMessageService、SendOnWecomService、SendReplyJob 注册、Inbox JSON。
+
+---
+
+### Task 10: Webhook 控制器
+
+**涉及文件：**
+- 新建：`app/controllers/webhooks/wecom_controller.rb`
+
+- [ ] **步骤 1：创建控制器**
 
 ```ruby
 class Webhooks::WecomController < ActionController::API
@@ -527,7 +572,7 @@ class Webhooks::WecomController < ActionController::API
       return head :unauthorized
     end
 
-    plaintext = Wecom::Crypto.decrypt(channel.encoding_aes_key, encrypted)
+    plaintext = Wecom::Crypto.decrypt(channel.encoding_aes_key, encrypted, expected_receive_id: channel.corp_id)
     render plain: plaintext
   rescue ActiveRecord::RecordNotFound
     head :not_found
@@ -546,21 +591,14 @@ class Webhooks::WecomController < ActionController::API
 end
 ```
 
-- [ ] **Step 2: Commit**
-
-```bash
-git add app/controllers/webhooks/wecom_controller.rb
-git commit -m "feat: add Wecom webhook controller (verify + process)"
-```
-
 ---
 
-### Task 10: Webhook Events Job
+### Task 11: Webhook 事件 Job
 
-**Files:**
-- Create: `app/jobs/webhooks/wecom_events_job.rb`
+**涉及文件：**
+- 新建：`app/jobs/webhooks/wecom_events_job.rb`
 
-- [ ] **Step 1: Create the job**
+- [ ] **步骤 1：创建 Job**
 
 ```ruby
 require 'rexml/document'
@@ -580,20 +618,30 @@ class Webhooks::WecomEventsJob < ApplicationJob
 
     return unless valid_signature?(channel)
 
-    decrypted = Wecom::Crypto.decrypt(channel.encoding_aes_key, extract_encrypted_body)
+    decrypted = decrypt_payload(channel)
     return unless decrypted
 
     event_hash = parse_xml(decrypted)
     return unless event_hash
 
+    # process_event → sync_and_process_messages 负责 API/DB/Redis 操作；
+    # 其中的异常会向上传播给 Sidekiq 进行重试。
     process_event(channel, event_hash)
-  rescue StandardError => e
-    Rails.logger.error "[WecomEventsJob] Error: #{e.message}"
   end
 
   private
 
-  DEDUP_TTL = 300
+  def decrypt_payload(channel)
+    Wecom::Crypto.decrypt(
+      channel.encoding_aes_key,
+      extract_encrypted_body,
+      expected_receive_id: channel.corp_id
+    )
+  rescue StandardError => e
+    # 签名、解密或 receiveid 不匹配 — 永久性失败，丢弃不重试。
+    Rails.logger.error "[WecomEventsJob] Decrypt/validation failed (will not retry): #{e.message}"
+    nil
+  end
 
   def find_channel
     Channel::Wecom.find_by(identifier: @params[:identifier])
@@ -627,81 +675,76 @@ class Webhooks::WecomEventsJob < ApplicationJob
   end
 
   def process_event(channel, event_hash)
-    msg_type = event_hash[:MsgType]
-    event_type = event_hash.dig(:Event, :EventType)
+    return unless event_hash[:MsgType] == 'event'
+    return unless event_hash[:Event] == 'kf_msg_or_event'
 
-    case msg_type
-    when 'event'
-      process_kf_event(channel, event_hash)
-    when 'text', 'image', 'voice', 'video', 'file'
-      process_direct_message(channel, event_hash)
-    else
-      Rails.logger.info "[WecomEventsJob] Unhandled MsgType: #{msg_type}"
-    end
-  end
-
-  def process_kf_event(channel, event_hash)
-    event_type = event_hash.dig(:Event, :EventType)
-
-    case event_type
-    when 'kf_msg_or_event'
-      sync_and_process_messages(channel, event_hash)
-    else
-      Rails.logger.info "[WecomEventsJob] Unhandled event type: #{event_type}"
-    end
-  end
-
-  def process_direct_message(channel, event_hash)
-    # Direct messages via sync_msg callback (msgtype text/image etc in body)
-    # For now, also try sync_msg to ensure we have the full message
     sync_and_process_messages(channel, event_hash)
   end
 
   def sync_and_process_messages(channel, event_hash)
-    token = event_hash.dig(:Event, :Token) || event_hash[:Token]
-    cursor = event_hash.dig(:Event, :Cursor) || event_hash[:Cursor]
+    return unless Redis::Alfred.set("wecom:sync:#{channel.id}", '1', nx: true, ex: 60)
+
+    token = event_hash[:Token]
+    open_kfid = event_hash[:OpenKfId]
+    return if token.blank?
+    return if open_kfid != channel.open_kfid
+
+    cursor = channel.sync_cursor
 
     loop do
-      response = channel.client.sync_msg(cursor: cursor, token: token, open_kfid: channel.open_kfid)
+      response = channel.client.sync_msg(
+        cursor: cursor,
+        token: token,
+        open_kfid: open_kfid
+      )
 
-      msg_list = response['msg_list'] || []
-
-      msg_list.each do |msg|
+      (response['msg_list'] || []).each do |msg|
         next unless msg['msgtype'] == 'text'
+        next unless msg['origin'].to_i == 3
+        next unless msg['open_kfid'] == channel.open_kfid
 
         msgid = msg['msgid']
-        dedup_key = "#{DEDUP_KEY_PREFIX}:#{channel.inbox.id}:#{msgid}"
+        # DB 兜底：如果已有相同 source_id 的消息则跳过。
+        # Redis 锁是并发防护手段，不是最终事实来源。
+        next if channel.inbox.messages.exists?(source_id: msgid.to_s)
 
+        dedup_key = "#{DEDUP_KEY_PREFIX}:#{channel.inbox.id}:#{msgid}"
         next unless Redis::Alfred.set(dedup_key, '1', nx: true, ex: DEDUP_TTL)
 
-        Wecom::IncomingMessageService.new(inbox: channel.inbox, message_data: msg.with_indifferent_access).perform
+        begin
+          Wecom::IncomingMessageService.new(
+            inbox: channel.inbox,
+            message_data: msg.with_indifferent_access
+          ).perform
+        rescue StandardError => e
+          # 保存失败时清除去重锁，避免阻塞 Sidekiq 重试。
+          Redis::Alfred.del(dedup_key)
+          raise
+        end
       end
 
-      has_more = response['has_more'].to_i == 1
-      break unless has_more
-
       cursor = response['next_cursor']
+      channel.update!(sync_cursor: cursor) if cursor.present?
+
+      # 重要：必须检查 has_more，不能靠判断 msg_list 是否为空。
+      # 企业微信可能出现 has_more=1 但 msg_list 为空的情况。
+      break unless response['has_more'].to_i == 1
       break if cursor.blank?
     end
+  ensure
+    Redis::Alfred.del("wecom:sync:#{channel.id}") if channel
   end
 end
 ```
 
-- [ ] **Step 2: Commit**
-
-```bash
-git add app/jobs/webhooks/wecom_events_job.rb
-git commit -m "feat: add Wecom webhook events job with sync_msg and dedup"
-```
-
 ---
 
-### Task 11: Incoming Message Service
+### Task 12: 入站消息服务
 
-**Files:**
-- Create: `app/services/wecom/incoming_message_service.rb`
+**涉及文件：**
+- 新建：`app/services/wecom/incoming_message_service.rb`
 
-- [ ] **Step 1: Create the incoming message service**
+- [ ] **步骤 1：创建入站消息服务**
 
 ```ruby
 class Wecom::IncomingMessageService
@@ -732,25 +775,15 @@ class Wecom::IncomingMessageService
   end
 
   def contact_attributes(external_userid)
-    customer_info = fetch_customer_info(external_userid)
-
+    # MVP：用 external_userid 生成默认联系人名称。
+    # 客户信息补全（通过 get_customer 获取名称/头像）应放在二期异步 job 中，
+    # 避免增加单条消息的处理延迟。
     {
-      name: customer_info&.dig('name') || "WeCom User #{external_userid[0..7]}",
+      name: "WeCom User #{external_userid[0..7]}",
       additional_attributes: {
-        wecom_external_userid: external_userid,
-        wecom_customer_name: customer_info&.dig('name'),
-        wecom_customer_avatar: customer_info&.dig('avatar')
-      }.compact
+        wecom_external_userid: external_userid
+      }
     }
-  end
-
-  def fetch_customer_info(external_userid)
-    response = inbox.channel.client.get_customer(external_userid: external_userid)
-    customer_list = response['customer_list'] || []
-    customer_list.first
-  rescue StandardError => e
-    Rails.logger.info "[WecomIncoming] Failed to fetch customer info for #{external_userid}: #{e.message}"
-    nil
   end
 
   def set_conversation
@@ -788,21 +821,14 @@ class Wecom::IncomingMessageService
 end
 ```
 
-- [ ] **Step 2: Commit**
-
-```bash
-git add app/services/wecom/incoming_message_service.rb
-git commit -m "feat: add Wecom incoming message service"
-```
-
 ---
 
-### Task 12: Send Service
+### Task 13: 发送服务
 
-**Files:**
-- Create: `app/services/wecom/send_on_wecom_service.rb`
+**涉及文件：**
+- 新建：`app/services/wecom/send_on_wecom_service.rb`
 
-- [ ] **Step 1: Create the send service**
+- [ ] **步骤 1：创建发送服务**
 
 ```ruby
 class Wecom::SendOnWecomService < Base::SendOnChannelService
@@ -820,7 +846,7 @@ class Wecom::SendOnWecomService < Base::SendOnChannelService
       open_kfid: channel.open_kfid,
       msgid: "cw-#{message.id}",
       msgtype: 'text',
-      text: { content: message.content },
+      text: { content: message.outgoing_content },
       servicer_userid: servicer_userid
     )
 
@@ -839,76 +865,31 @@ class Wecom::SendOnWecomService < Base::SendOnChannelService
 end
 ```
 
-- [ ] **Step 2: Commit**
-
-```bash
-git add app/services/wecom/send_on_wecom_service.rb
-git commit -m "feat: add Wecom send service with agent mapping support"
-```
-
 ---
 
-### Task 13: SendReplyJob Registration
+### Task 14: SendReplyJob 注册
 
-**Files:**
-- Modify: `app/jobs/send_reply_job.rb`
+**涉及文件：**
+- 修改：`app/jobs/send_reply_job.rb`
 
-- [ ] **Step 1: Register WeCom in CHANNEL_SERVICES**
+- [ ] **步骤 1：在 CHANNEL_SERVICES 中注册 WeCom**
 
-Find the `CHANNEL_SERVICES` hash in `app/jobs/send_reply_job.rb`. Add after the LINE entry:
+在 `app/jobs/send_reply_job.rb` 中找到 `CHANNEL_SERVICES` 哈希。在 LINE 条目后添加：
 
 ```ruby
     'Channel::Wecom' => ::Wecom::SendOnWecomService,
 ```
 
-- [ ] **Step 2: Commit**
-
-```bash
-git add app/jobs/send_reply_job.rb
-git commit -m "feat: register Wecom send service in SendReplyJob"
-```
-
 ---
 
-### Task 14: Routes
+### Task 15: Inbox JSON（渠道自定义字段）
 
-**Files:**
-- Modify: `config/routes.rb`
+**涉及文件：**
+- 修改：`app/views/api/v1/models/_inbox.json.jbuilder`
 
-- [ ] **Step 1: Add WeCom webhook routes**
+- [ ] **步骤 1：添加 WeCom 专属属性**
 
-Find the webhook routes section (around the LINE/Telegram webhook routes). Add:
-
-```ruby
-  get  'webhooks/wecom/:identifier', to: 'webhooks/wecom#verify_url'
-  post 'webhooks/wecom/:identifier', to: 'webhooks/wecom#process_payload'
-```
-
-- [ ] **Step 2: Verify routes**
-
-```bash
-bundle exec rails routes | grep wecom
-```
-
-Expected: Shows both GET and POST routes for webhooks/wecom.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add config/routes.rb
-git commit -m "feat: add Wecom webhook routes"
-```
-
----
-
-### Task 15: Inbox JSON (Channel-specific fields)
-
-**Files:**
-- Modify: `app/views/api/v1/models/_inbox.json.jbuilder`
-
-- [ ] **Step 1: Add WeCom-specific attributes**
-
-Find the section near the end of the file (after WhatsApp attributes). Add:
+在文件末尾附近（WhatsApp 属性之后）。添加：
 
 ```ruby
 ## WeCom Attributes
@@ -919,292 +900,380 @@ if resource.wecom?
 end
 ```
 
-- [ ] **Step 2: Commit**
+---
 
-```bash
-git add app/views/api/v1/models/_inbox.json.jbuilder
-git commit -m "feat: expose Wecom channel attributes in inbox JSON"
-```
+---
+## 阶段三：前端收件箱配置界面
+*提交信息：`feat(wecom): add inbox setup UI`*
+
+在后端收发了冒烟测试通过后再构建前端。任务：Task 16-20 — 收件箱类型定义、i18n 文案、Wecom.vue 表单、ChannelFactory/ChannelList 注册、冒烟测试。
 
 ---
 
-### Task 16: Frontend — Inbox Types & Helpers
+### Task 16: 前端 — 收件箱类型与辅助函数
 
-**Files:**
-- Modify: `app/javascript/dashboard/helper/inbox.js`
-- Modify: `app/javascript/dashboard/composables/useInbox.js`
+**涉及文件：**
+- 修改：`app/javascript/dashboard/helper/inbox.js`
+- 修改：`app/javascript/dashboard/composables/useInbox.js`
 
-- [ ] **Step 1: Register WECOM in INBOX_TYPES**
+- [ ] **步骤 1：在 INBOX_TYPES 中注册 WECOM**
 
-In `app/javascript/dashboard/helper/inbox.js`, find the existing type definitions. Add:
+在 `app/javascript/dashboard/helper/inbox.js` 中找到已有的类型定义。添加：
 
 ```javascript
 export const INBOX_TYPES = {
-  // ... existing types
+  // ... 已有类型（WEB、FB、TWITTER、TWILIO、WHATSAPP、API、EMAIL、TELEGRAM、LINE、SMS、INSTAGRAM、TIKTOK）
   WECOM: 'Channel::Wecom',
 };
 ```
 
-- [ ] **Step 2: Add channel icon mapping**
+- [ ] **步骤 2：添加渠道图标映射**
 
-In the same file, find `channelIconMap` or equivalent icon mapping. Add:
-
-```javascript
-  wecom: 'ri-wechat-line',
-```
-
-- [ ] **Step 3: Add isAWecomChannel to useInbox composable**
-
-In `app/javascript/dashboard/composables/useInbox.js`, find computed properties like `isATelegramChannel`. Add:
+在同一文件 `inbox.js` 中，找到 `INBOX_ICON_MAP_FILL` 和 `INBOX_ICON_MAP_LINE`。添加 wecom 条目：
 
 ```javascript
-const isAWecomChannel = computed(() => inbox.value.channel_type === INBOX_TYPES.WECOM);
+// 在 INBOX_ICON_MAP_FILL 中：
+[INBOX_TYPES.WECOM]: 'i-ri-wechat-fill',
+
+// 在 INBOX_ICON_MAP_LINE 中：
+[INBOX_TYPES.WECOM]: 'i-ri-wechat-line',
 ```
 
-And add `isAWecomChannel` to the return object.
+同时在 `getReadableInboxByType` 和 `getInboxClassByType` 中添加：
+```javascript
+// 在 getReadableInboxByType 中：
+case INBOX_TYPES.WECOM:
+  return 'wecom';
 
-- [ ] **Step 4: Commit**
-
-```bash
-git add app/javascript/dashboard/helper/inbox.js app/javascript/dashboard/composables/useInbox.js
-git commit -m "feat(frontend): register WeCom inbox type and helper"
+// 在 getInboxClassByType 中：
+case INBOX_TYPES.WECOM:
+  return 'brand-wechat';
 ```
+
+- [ ] **步骤 3：在 useInbox 组合式函数中添加 isAWecomChannel**
+
+在 `app/javascript/dashboard/composables/useInbox.js` 中添加 computed 属性（参照 isALineChannel 模式）：
+
+```javascript
+const isAWecomChannel = computed(() => {
+  return channelType.value === INBOX_TYPES.WECOM;
+});
+```
+
+并将 `isAWecomChannel` 添加到返回对象中。
 
 ---
 
-### Task 17: Frontend — i18n Strings
+### Task 17: 前端 — i18n 文案
 
-**Files:**
-- Modify: `app/javascript/dashboard/i18n/locale/en/inboxMgmt.json`
+**涉及文件：**
+- 修改：`app/javascript/dashboard/i18n/locale/en/inboxMgmt.json`
 
-- [ ] **Step 1: Add WeCom i18n strings**
+- [ ] **步骤 1：添加 WeCom i18n 文案（两处）**
 
-Find a channel section like `LINE_CHANNEL`. Add a similar `WECOM_CHANNEL` section:
+**位置一：** 在 `ADD.AUTH.CHANNEL` 区域（渠道选择列表，约在 `VOICE` 之前的第 506 行），添加：
 
 ```json
-  "WECOM_CHANNEL": {
-    "TITLE": "WeChat Work",
-    "DESC": "Connect with customers via WeChat Work KF Agent",
-    "CORP_ID": {
-      "LABEL": "Corp ID",
-      "PLACEHOLDER": "ww1234567890abcdef"
-    },
-    "OPEN_KFID": {
-      "LABEL": "Open KFID",
-      "PLACEHOLDER": "wkxxxxxxxxxxxxxxxxxx"
-    },
-    "SECRET": {
-      "LABEL": "Secret",
-      "PLACEHOLDER": "Enter the KF agent secret"
-    },
-    "TOKEN": {
-      "LABEL": "Callback Token",
-      "PLACEHOLDER": "Enter callback token"
-    },
-    "ENCODING_AES_KEY": {
-      "LABEL": "Encoding AES Key",
-      "PLACEHOLDER": "43-character encoding AES key"
-    },
-    "AGENT_MAPPINGS": {
-      "LABEL": "Agent Mappings",
-      "DESC": "Map Chatwoot users to WeCom servicer user IDs"
-    },
-    "SUBMIT_BUTTON": "Create WeCom Channel",
-    "API": {
-      "ERROR_MESSAGE": "There was an error creating the WeCom channel"
-    }
-  }
+          "WECOM": {
+            "TITLE": "WeCom",
+            "DESCRIPTION": "Integrate your WeCom KF Agent channel"
+          },
 ```
 
-- [ ] **Step 2: Commit**
+**位置二：** 在 `LINE_CHANNEL` 区域之后（约第 439 行），添加 `WECOM_CHANNEL` 区域用于创建表单。参照 LINE_CHANNEL 模式（包含 `CHANNEL_NAME`）：
 
-```bash
-git add app/javascript/dashboard/i18n/locale/en/inboxMgmt.json
-git commit -m "feat(frontend): add WeCom channel i18n strings"
+```json
+      "WECOM_CHANNEL": {
+        "TITLE": "WeCom Channel",
+        "DESC": "Integrate with WeCom KF Agent and start supporting your customers.",
+        "CHANNEL_NAME": {
+          "LABEL": "Channel Name",
+          "PLACEHOLDER": "Please enter a channel name",
+          "ERROR": "This field is required"
+        },
+        "CORP_ID": {
+          "LABEL": "Corp ID",
+          "PLACEHOLDER": "ww1234567890abcdef"
+        },
+        "OPEN_KFID": {
+          "LABEL": "Open KFID",
+          "PLACEHOLDER": "wkxxxxxxxxxxxxxxxxxx"
+        },
+        "SECRET": {
+          "LABEL": "Secret",
+          "PLACEHOLDER": "Enter the KF agent secret"
+        },
+        "TOKEN": {
+          "LABEL": "Callback Token",
+          "PLACEHOLDER": "Enter callback token"
+        },
+        "ENCODING_AES_KEY": {
+          "LABEL": "Encoding AES Key",
+          "PLACEHOLDER": "43-character encoding AES key"
+        },
+        "SUBMIT_BUTTON": "Create WeCom Channel",
+        "API": {
+          "ERROR_MESSAGE": "We were not able to save the WeCom channel"
+        },
+        "API_CALLBACK": {
+          "TITLE": "Callback URL",
+          "SUBTITLE": "You have to configure the webhook URL in WeCom KF Agent with the URL mentioned here."
+        }
+      }
 ```
 
 ---
 
-### Task 18: Frontend — Channel Config Form (Wecom.vue)
+### Task 18: 前端 — 渠道配置表单 (Wecom.vue)
 
-**Files:**
-- Create: `app/javascript/dashboard/routes/dashboard/settings/inbox/channels/Wecom.vue`
+> **说明：** 采用 Options API + vuelidate，与现有收件箱渠道配置模式（Line.vue、Telegram.vue 等）保持一致，非 Composition API。这是有意为之的代码风格统一，并非偏离 AGENTS.md 规范。
 
-- [ ] **Step 1: Create the Wecom.vue form component**
+**涉及文件：**
+- 新建：`app/javascript/dashboard/routes/dashboard/settings/inbox/channels/Wecom.vue`
+
+- [ ] **步骤 1：创建 Wecom.vue 表单组件**
 
 ```vue
-<template>
-  <form class="flex flex-wrap" @submit.prevent="submit">
-    <div class="w-full">
-      <label>{{ $t('INBOX_MGMT.ADD.WECOM_CHANNEL.CORP_ID.LABEL') }}</label>
-      <input
-        v-model.trim="corpId"
-        type="text"
-        class="mt-1 block w-full rounded-md border border-slate-300 px-3 py-2"
-        :placeholder="$t('INBOX_MGMT.ADD.WECOM_CHANNEL.CORP_ID.PLACEHOLDER')"
-        required
-      />
-    </div>
-
-    <div class="w-full mt-4">
-      <label>{{ $t('INBOX_MGMT.ADD.WECOM_CHANNEL.OPEN_KFID.LABEL') }}</label>
-      <input
-        v-model.trim="openKfid"
-        type="text"
-        class="mt-1 block w-full rounded-md border border-slate-300 px-3 py-2"
-        :placeholder="$t('INBOX_MGMT.ADD.WECOM_CHANNEL.OPEN_KFID.PLACEHOLDER')"
-        required
-      />
-    </div>
-
-    <div class="w-full mt-4">
-      <label>{{ $t('INBOX_MGMT.ADD.WECOM_CHANNEL.SECRET.LABEL') }}</label>
-      <input
-        v-model.trim="secret"
-        type="password"
-        class="mt-1 block w-full rounded-md border border-slate-300 px-3 py-2"
-        :placeholder="$t('INBOX_MGMT.ADD.WECOM_CHANNEL.SECRET.PLACEHOLDER')"
-        required
-      />
-    </div>
-
-    <div class="w-full mt-4">
-      <label>{{ $t('INBOX_MGMT.ADD.WECOM_CHANNEL.TOKEN.LABEL') }}</label>
-      <input
-        v-model.trim="token"
-        type="text"
-        class="mt-1 block w-full rounded-md border border-slate-300 px-3 py-2"
-        :placeholder="$t('INBOX_MGMT.ADD.WECOM_CHANNEL.TOKEN.PLACEHOLDER')"
-        required
-      />
-    </div>
-
-    <div class="w-full mt-4">
-      <label>{{ $t('INBOX_MGMT.ADD.WECOM_CHANNEL.ENCODING_AES_KEY.LABEL') }}</label>
-      <input
-        v-model.trim="encodingAesKey"
-        type="text"
-        class="mt-1 block w-full rounded-md border border-slate-300 px-3 py-2"
-        :placeholder="$t('INBOX_MGMT.ADD.WECOM_CHANNEL.ENCODING_AES_KEY.PLACEHOLDER')"
-        required
-      />
-    </div>
-
-    <div class="w-full mt-6">
-      <button
-        type="submit"
-        class="rounded-md bg-woot-500 px-4 py-2 text-white hover:bg-woot-600"
-      >
-        {{ $t('INBOX_MGMT.ADD.WECOM_CHANNEL.SUBMIT_BUTTON') }}
-      </button>
-    </div>
-  </form>
-</template>
-
-<script setup>
-import { ref } from 'vue';
-import { useStore } from 'dashboard/store';
-import { useRouter } from 'vue-router';
+<script>
+import { mapGetters } from 'vuex';
+import { useVuelidate } from '@vuelidate/core';
 import { useAlert } from 'dashboard/composables';
+import { required } from '@vuelidate/validators';
+import router from '../../../../index';
+import PageHeader from '../../SettingsSubPageHeader.vue';
+import NextButton from 'dashboard/components-next/button/Button.vue';
 
-const store = useStore();
-const router = useRouter();
+export default {
+  components: {
+    PageHeader,
+    NextButton,
+  },
+  setup() {
+    return { v$: useVuelidate() };
+  },
+  data() {
+    return {
+      channelName: '',
+      corpId: '',
+      openKfid: '',
+      secret: '',
+      token: '',
+      encodingAesKey: '',
+    };
+  },
+  computed: {
+    ...mapGetters({
+      uiFlags: 'inboxes/getUIFlags',
+    }),
+  },
+  validations: {
+    channelName: { required },
+    corpId: { required },
+    openKfid: { required },
+    secret: { required },
+    token: { required },
+    encodingAesKey: { required },
+  },
+  methods: {
+    async createChannel() {
+      this.v$.$touch();
+      if (this.v$.$invalid) {
+        return;
+      }
 
-const corpId = ref('');
-const openKfid = ref('');
-const secret = ref('');
-const token = ref('');
-const encodingAesKey = ref('');
+      try {
+        const wecomChannel = await this.$store.dispatch(
+          'inboxes/createChannel',
+          {
+            name: this.channelName?.trim(),
+            channel: {
+              type: 'wecom',
+              corp_id: this.corpId,
+              open_kfid: this.openKfid,
+              secret: this.secret,
+              token: this.token,
+              encoding_aes_key: this.encodingAesKey,
+              agent_mappings: {},
+            },
+          }
+        );
 
-async function submit() {
-  try {
-    const response = await store.dispatch('inboxes/createChannel', {
-      channel: {
-        type: 'wecom',
-        corp_id: corpId.value,
-        open_kfid: openKfid.value,
-        secret: secret.value,
-        token: token.value,
-        encoding_aes_key: encodingAesKey.value,
-        agent_mappings: {},
-      },
-    });
-    const inboxId = response.id;
-    router.push({
-      name: 'settings_inboxes_add_agents',
-      params: { inbox_id: inboxId.toString() },
-    });
-  } catch (error) {
-    useAlert(error.response?.data?.message || error.message);
-  }
-}
+        router.replace({
+          name: 'settings_inboxes_add_agents',
+          params: {
+            page: 'new',
+            inbox_id: wecomChannel.id,
+          },
+        });
+      } catch (error) {
+        useAlert(this.$t('INBOX_MGMT.ADD.WECOM_CHANNEL.API.ERROR_MESSAGE'));
+      }
+    },
+  },
+};
 </script>
-```
 
-- [ ] **Step 2: Commit**
+<template>
+  <div class="h-full w-full p-6 col-span-6">
+    <PageHeader
+      :header-title="$t('INBOX_MGMT.ADD.WECOM_CHANNEL.TITLE')"
+      :header-content="$t('INBOX_MGMT.ADD.WECOM_CHANNEL.DESC')"
+    />
+    <form
+      class="flex flex-wrap flex-col mx-0"
+      @submit.prevent="createChannel()"
+    >
+      <div class="flex-shrink-0 flex-grow-0">
+        <label :class="{ error: v$.channelName.$error }">
+          {{ $t('INBOX_MGMT.ADD.WECOM_CHANNEL.CHANNEL_NAME.LABEL') }}
+          <input
+            v-model="channelName"
+            type="text"
+            :placeholder="
+              $t('INBOX_MGMT.ADD.WECOM_CHANNEL.CHANNEL_NAME.PLACEHOLDER')
+            "
+            @blur="v$.channelName.$touch"
+          />
+          <span v-if="v$.channelName.$error" class="message">{{
+            $t('INBOX_MGMT.ADD.WECOM_CHANNEL.CHANNEL_NAME.ERROR')
+          }}</span>
+        </label>
+      </div>
 
-```bash
-git add app/javascript/dashboard/routes/dashboard/settings/inbox/channels/Wecom.vue
-git commit -m "feat(frontend): add Wecom channel config form"
+      <div class="flex-shrink-0 flex-grow-0">
+        <label :class="{ error: v$.corpId.$error }">
+          {{ $t('INBOX_MGMT.ADD.WECOM_CHANNEL.CORP_ID.LABEL') }}
+          <input
+            v-model="corpId"
+            type="text"
+            :placeholder="
+              $t('INBOX_MGMT.ADD.WECOM_CHANNEL.CORP_ID.PLACEHOLDER')
+            "
+            @blur="v$.corpId.$touch"
+          />
+        </label>
+      </div>
+
+      <div class="flex-shrink-0 flex-grow-0">
+        <label :class="{ error: v$.openKfid.$error }">
+          {{ $t('INBOX_MGMT.ADD.WECOM_CHANNEL.OPEN_KFID.LABEL') }}
+          <input
+            v-model="openKfid"
+            type="text"
+            :placeholder="
+              $t('INBOX_MGMT.ADD.WECOM_CHANNEL.OPEN_KFID.PLACEHOLDER')
+            "
+            @blur="v$.openKfid.$touch"
+          />
+        </label>
+      </div>
+
+      <div class="flex-shrink-0 flex-grow-0">
+        <label :class="{ error: v$.secret.$error }">
+          {{ $t('INBOX_MGMT.ADD.WECOM_CHANNEL.SECRET.LABEL') }}
+          <input
+            v-model="secret"
+            type="text"
+            :placeholder="
+              $t('INBOX_MGMT.ADD.WECOM_CHANNEL.SECRET.PLACEHOLDER')
+            "
+            @blur="v$.secret.$touch"
+          />
+        </label>
+      </div>
+
+      <div class="flex-shrink-0 flex-grow-0">
+        <label :class="{ error: v$.token.$error }">
+          {{ $t('INBOX_MGMT.ADD.WECOM_CHANNEL.TOKEN.LABEL') }}
+          <input
+            v-model="token"
+            type="text"
+            :placeholder="
+              $t('INBOX_MGMT.ADD.WECOM_CHANNEL.TOKEN.PLACEHOLDER')
+            "
+            @blur="v$.token.$touch"
+          />
+        </label>
+      </div>
+
+      <div class="flex-shrink-0 flex-grow-0">
+        <label :class="{ error: v$.encodingAesKey.$error }">
+          {{ $t('INBOX_MGMT.ADD.WECOM_CHANNEL.ENCODING_AES_KEY.LABEL') }}
+          <input
+            v-model="encodingAesKey"
+            type="text"
+            :placeholder="
+              $t('INBOX_MGMT.ADD.WECOM_CHANNEL.ENCODING_AES_KEY.PLACEHOLDER')
+            "
+            @blur="v$.encodingAesKey.$touch"
+          />
+        </label>
+      </div>
+
+      <div class="w-full mt-4">
+        <NextButton
+          :is-loading="uiFlags.isCreating"
+          type="submit"
+          solid
+          blue
+          :label="$t('INBOX_MGMT.ADD.WECOM_CHANNEL.SUBMIT_BUTTON')"
+        />
+      </div>
+    </form>
+  </div>
+</template>
 ```
 
 ---
 
-### Task 19: Frontend — ChannelFactory & ChannelList Registration
+### Task 19: 前端 — ChannelFactory 与 ChannelList 注册
 
-**Files:**
-- Modify: `app/javascript/dashboard/routes/dashboard/settings/inbox/ChannelFactory.vue`
-- Modify: `app/javascript/dashboard/routes/dashboard/settings/inbox/ChannelList.vue`
+**涉及文件：**
+- 修改：`app/javascript/dashboard/routes/dashboard/settings/inbox/ChannelFactory.vue`
+- 修改：`app/javascript/dashboard/routes/dashboard/settings/inbox/ChannelList.vue`
 
-- [ ] **Step 1: Register Wecom component in ChannelFactory**
+- [ ] **步骤 1：在 ChannelFactory 中注册 Wecom 组件**
 
-In `ChannelFactory.vue`, import Wecom:
+在 `ChannelFactory.vue` 中导入 Wecom：
 
 ```javascript
 import Wecom from './channels/Wecom.vue';
 ```
 
-And add to `channelViewList`:
+并添加到 `channelViewList`：
 
 ```javascript
   wecom: Wecom,
 ```
 
-- [ ] **Step 2: Add Wecom entry to ChannelList**
+- [ ] **步骤 2：在 ChannelList 中添加 Wecom 入口**
 
-In `ChannelList.vue`, find the `channelList` computed array. Add an entry:
+在 `ChannelList.vue` 中，找到 `channelList` computed 中的 `channels` 数组。在 LINE 条目后添加：
 
 ```javascript
-  {
-    key: 'wecom',
-    title: this.$t('INBOX_MGMT.ADD.WECOM_CHANNEL.TITLE'),
-    desc: this.$t('INBOX_MGMT.ADD.WECOM_CHANNEL.DESC'),
-    icon: 'ri-wechat-line',
-  },
-```
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add app/javascript/dashboard/routes/dashboard/settings/inbox/ChannelFactory.vue app/javascript/dashboard/routes/dashboard/settings/inbox/ChannelList.vue
-git commit -m "feat(frontend): register Wecom in ChannelFactory and ChannelList"
+    {
+      key: 'wecom',
+      title: t('INBOX_MGMT.ADD.AUTH.CHANNEL.WECOM.TITLE'),
+      description: t('INBOX_MGMT.ADD.AUTH.CHANNEL.WECOM.DESCRIPTION'),
+      icon: 'i-ri-wechat-fill',
+    },
 ```
 
 ---
 
-### Task 20: Integration Smoke Test
+### Task 20: 集成冒烟测试
 
-**Files:** None (manual verification)
+**涉及文件：** 无（手动验证）
 
-- [ ] **Step 1: Verify Rails boot with new code**
+- [ ] **步骤 1：验证 Rails 正常启动**
 
 ```bash
 bundle exec rails runner "puts 'OK'"
 ```
 
-Expected: `OK` (no autoloading errors).
+预期：`OK`（无自动加载错误）。
 
-- [ ] **Step 2: Create a WeCom channel via Rails console**
+- [ ] **步骤 2：通过 Rails console 创建 WeCom 渠道**
 
 ```bash
 bundle exec rails runner "
@@ -1220,9 +1289,9 @@ puts 'Channel created: ' + channel.identifier
 "
 ```
 
-Expected: Prints `Channel created: <hex-identifier>`.
+预期：输出 `Channel created: <hex-identifier>`。
 
-- [ ] **Step 3: Verify webhook endpoint responds**
+- [ ] **步骤 3：验证 webhook 端点可达**
 
 ```bash
 bundle exec rails runner "
@@ -1231,36 +1300,38 @@ puts 'Identifier: ' + identifier
 "
 ```
 
-Take the identifier and verify:
+拿到 identifier 后验证：
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}' "http://localhost:3000/webhooks/wecom/<identifier>?msg_signature=test&timestamp=1&nonce=n&echostr=dGVzdA=="
 ```
 
-Expected: Returns HTTP status code (probably 500 or 200 depending on signature validity, but the route resolves).
+预期：返回 HTTP 状态码（路由可解析）。
 
-- [ ] **Step 4: Commit state check**
+- [ ] **步骤 4：验证 token 获取无递归**
 
-```bash
-git status
-```
-
-Confirm all expected files are committed.
+审查调用链：`request` → `access_token` → `refresh_token` → `fetch_access_token`（直接 HTTP，不经过 `request`）。在源码中确认不存在循环调用路径。
 
 ---
 
-### Task 21: Final Commit
+## 提交指令
 
-- [ ] **Step 1: Verify no uncommitted changes**
+每个阶段完成后创建一次提交：
 
+**阶段一提交：**
 ```bash
-git diff --stat
+git add db/migrate/ db/schema.rb app/models/channel/wecom.rb lib/wecom/ app/models/account.rb app/models/inbox.rb app/controllers/api/v1/accounts/inboxes_controller.rb app/helpers/api/v1/inboxes_helper.rb config/routes.rb
+git commit -m "feat(wecom): add backend channel plumbing"
 ```
 
-- [ ] **Step 2: Verify file list matches spec**
-
+**阶段二提交：**
 ```bash
-git log --oneline develop..HEAD
+git add app/controllers/webhooks/wecom_controller.rb app/jobs/webhooks/wecom_events_job.rb app/services/wecom/ app/jobs/send_reply_job.rb app/views/api/v1/models/_inbox.json.jbuilder
+git commit -m "feat(wecom): add webhook sync and send services"
 ```
 
-Expected: Shows 19 commits for all tasks in this plan.
+**阶段三提交：**
+```bash
+git add app/javascript/dashboard/helper/inbox.js app/javascript/dashboard/composables/useInbox.js app/javascript/dashboard/i18n/locale/en/inboxMgmt.json app/javascript/dashboard/routes/dashboard/settings/inbox/channels/Wecom.vue app/javascript/dashboard/routes/dashboard/settings/inbox/ChannelFactory.vue app/javascript/dashboard/routes/dashboard/settings/inbox/ChannelList.vue
+git commit -m "feat(wecom): add inbox setup UI"
+```

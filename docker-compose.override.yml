@@ -1,0 +1,23 @@
+services:
+  postgres:
+    environment:
+      - POSTGRES_HOST_AUTH_METHOD=trust
+    ports: !override
+      - "15432:5432"
+
+  mailhog:
+    image: redis:alpine
+    command: ["sh", "-c", "tail -f /dev/null"]
+    ports: !override []
+
+  rails:
+    environment:
+      - POSTGRES_PORT=5432
+      - RAILS_MAX_THREADS=10
+    entrypoint: ["sh", "-c", "tr -d '\\r' < docker/entrypoints/rails.sh > /tmp/rails-entrypoint.sh && sh /tmp/rails-entrypoint.sh \"$@\"", "--"]
+
+  vite:
+    environment:
+      - VITE_RUBY_HOST=0.0.0.0
+    entrypoint: ["sh", "-c", "tr -d '\\r' < docker/entrypoints/vite.sh > /tmp/vite-entrypoint.sh && sh /tmp/vite-entrypoint.sh \"$@\"", "--"]
+    command: ["ruby", "bin/vite", "dev"]

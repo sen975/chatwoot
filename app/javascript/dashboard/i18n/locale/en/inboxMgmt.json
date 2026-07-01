@@ -437,6 +437,43 @@
           "SUBTITLE": "You have to configure the webhook URL in LINE application with the URL mentioned here."
         }
       },
+      "WECOM_CHANNEL": {
+        "TITLE": "WeCom Channel",
+        "DESC": "Integrate with WeCom KF Agent and start supporting your customers.",
+        "CHANNEL_NAME": {
+          "LABEL": "Channel Name",
+          "PLACEHOLDER": "Please enter a channel name",
+          "ERROR": "This field is required"
+        },
+        "CORP_ID": {
+          "LABEL": "Corp ID",
+          "PLACEHOLDER": "ww1234567890abcdef"
+        },
+        "OPEN_KFID": {
+          "LABEL": "Open KFID",
+          "PLACEHOLDER": "wkxxxxxxxxxxxxxxxxxx"
+        },
+        "SECRET": {
+          "LABEL": "Secret",
+          "PLACEHOLDER": "Enter the KF agent secret"
+        },
+        "TOKEN": {
+          "LABEL": "Callback Token",
+          "PLACEHOLDER": "Enter callback token"
+        },
+        "ENCODING_AES_KEY": {
+          "LABEL": "Encoding AES Key",
+          "PLACEHOLDER": "43-character encoding AES key"
+        },
+        "SUBMIT_BUTTON": "Create WeCom Channel",
+        "API": {
+          "ERROR_MESSAGE": "We were not able to save the WeCom channel"
+        },
+        "API_CALLBACK": {
+          "TITLE": "Callback URL",
+          "SUBTITLE": "You have to configure the webhook URL in WeCom KF Agent with the URL mentioned here."
+        }
+      },
       "TELEGRAM_CHANNEL": {
         "TITLE": "Telegram Channel",
         "DESC": "Integrate with Telegram channel and start supporting your customers.",
@@ -499,6 +536,10 @@
           "TIKTOK": {
             "TITLE": "TikTok",
             "DESCRIPTION": "Connect your TikTok account"
+          },
+          "WECOM": {
+            "TITLE": "WeCom",
+            "DESCRIPTION": "Integrate your WeCom KF Agent channel"
           },
           "VOICE": {
             "TITLE": "Voice",
@@ -1201,6 +1242,7 @@
       "API": "API Channel",
       "INSTAGRAM": "Instagram",
       "TIKTOK": "TikTok",
+      "WECOM": "WeCom",
       "VOICE": "Voice"
     }
   }
