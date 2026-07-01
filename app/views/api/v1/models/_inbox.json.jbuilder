@@ -154,3 +154,10 @@ if resource.channel_type == 'Channel::Whatsapp' && resource.channel.respond_to?(
   json.voice_enabled resource.channel.voice_enabled?
   json.inbound_calls_enabled resource.channel.inbound_calls_enabled?
 end
+
+## WeCom Attributes
+if resource.wecom?
+  json.corp_id resource.channel.try(:corp_id)
+  json.open_kfid resource.channel.try(:open_kfid)
+  json.agent_mappings resource.channel.try(:agent_mappings)
+end
